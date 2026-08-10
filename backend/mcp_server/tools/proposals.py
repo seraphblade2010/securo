@@ -770,7 +770,7 @@ async def propose_update_recurring_transaction(
     description: str | None = None,
     amount: float | None = None,
     frequency: str | None = None,
-    weekend_adjustment: str | None = None,
+    weekend_adjustment: WeekendAdjustment | None = None,
     day_of_month: int | None = None,
     end_date: str | None = None,
     category_id: str | None = None,

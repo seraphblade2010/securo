@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.rule import Rule
 from app.models.category import Category
 from app.models.payee import Payee
+from app.models.recurring_transaction import RecurringTransaction
 from app.models.transaction import Transaction
 from app.schemas.rule import RuleCreate, RuleExportPayload, RuleImportResponse, RuleUpdate
 from app.services.rule_engine import evaluate_conditions, apply_rule_actions
@@ -35,13 +36,30 @@ def _rule_item_value(item, key: str):
     return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
 
 
+def _flatten_conditions(conditions: list) -> list:
+    """Return every leaf condition, unwrapping one level of AND/OR groups.
+
+    A rule's condition list mixes leaves with groups that hold their own leaves
+    (see `rule_engine.evaluate_conditions`). Field/operator checks apply to the
+    leaves either way, and the schema caps nesting at one level.
+    """
+    leaves = []
+    for node in conditions or []:
+        nested = _rule_item_value(node, "conditions")
+        if isinstance(nested, list):
+            leaves.extend(nested)
+        else:
+            leaves.append(node)
+    return leaves
+
+
 async def _validate_rule_definition(
     session: AsyncSession,
     workspace_id: uuid.UUID,
     conditions: list,
     actions: list,
 ) -> None:
-    for condition in conditions or []:
+    for condition in _flatten_conditions(conditions):
         field = _rule_item_value(condition, "field")
         op = _rule_item_value(condition, "op")
         if field not in _ALLOWED_CONDITION_FIELDS or op not in _ALLOWED_CONDITION_OPS:
@@ -1128,6 +1146,7 @@ async def preview_rules_for_transaction(
 async def apply_rules_to_transaction(
     session: AsyncSession, user_id: uuid.UUID, transaction: Transaction,
     skip_category_rules: bool = False,
+    skip_ignore_action: bool = False,
 ) -> None:
     """Apply all active rules to a transaction, modifying it in-place. Commits nothing.
 
@@ -1135,6 +1154,10 @@ async def apply_rules_to_transaction(
     haven't been migrated to pass workspace_id directly; rules are scoped by
     workspace via the transaction's own workspace_id when available, falling
     back to the legacy user filter so historical rows still match.
+
+    `skip_ignore_action` lets lifecycle callers defer an automatic ignore while
+    a pending row must remain eligible for reconciliation. Other matching
+    actions still apply normally.
     """
     rule_filter = Rule.user_id == user_id
     if getattr(transaction, "workspace_id", None) is not None:
@@ -1152,7 +1175,60 @@ async def apply_rules_to_transaction(
         conditions = rule.conditions or []
         actions = rule.actions or []
         if evaluate_conditions(rule.conditions_op, conditions, transaction):
-            category_set = apply_rule_actions(actions, transaction, category_set)
+            category_set = apply_rule_actions(
+                actions,
+                transaction,
+                category_set,
+                skip_ignore=skip_ignore_action,
+            )
+
+
+async def recurring_placeholder_rule_ignore(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    placeholder: Transaction,
+) -> bool:
+    """Re-evaluate only the deferred ignore on a generated occurrence."""
+    recurring_id = placeholder.recurring_transaction_id
+    if recurring_id is None:
+        return False
+    if placeholder.status != "pending":
+        return False
+
+    result = await session.execute(
+        select(RecurringTransaction).where(
+            RecurringTransaction.id == recurring_id,
+            RecurringTransaction.user_id == user_id,
+            RecurringTransaction.workspace_id == placeholder.workspace_id,
+        )
+    )
+    recurring = result.scalar_one_or_none()
+    if recurring is None or recurring.account_id is None:
+        return False
+
+    occurrence = Transaction(
+        user_id=recurring.user_id,
+        workspace_id=recurring.workspace_id,
+        account_id=recurring.account_id,
+        category_id=recurring.category_id,
+        description=recurring.description,
+        original_description=None,
+        description_is_rule_managed=False,
+        amount=recurring.amount,
+        currency=recurring.currency,
+        date=placeholder.date,
+        effective_date=placeholder.effective_date,
+        type=recurring.type,
+        source="recurring",
+        status=placeholder.status,
+        payee=None,
+        payee_id=None,
+        notes=None,
+        is_ignored=False,
+        recurring_transaction_id=recurring.id,
+    )
+    await apply_rules_to_transaction(session, user_id, occurrence)
+    return bool(occurrence.is_ignored)
 
 
 async def apply_single_rule(
